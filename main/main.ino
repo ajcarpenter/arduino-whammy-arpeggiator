@@ -1,4 +1,11 @@
 #include <MIDI.h>
+#include <EEPROM.h>
+
+#define CONFIG_VERSION "ls1"
+#define CONFIG_START 32
+
+struct Sequence;
+
 MIDI_CREATE_DEFAULT_INSTANCE();
 
 const int TEMPO_BUTTON_PIN = 2;
@@ -12,24 +19,34 @@ unsigned long lastTick = 0.0;
 unsigned long lastTickSubdivision = 0.0;
 int tickSubdivisionCount = 0;
 int tickSubdivisions = 4;
+bool isPlaying = false;
 
-int sequence[] = {
-	//0, 
-	1, 
-	3, 
-	5,
-	7,
-	//3, 
-	//4, 
-	//5, 
-	//6, 
-	//7, 
-	//8, 
-	//9, 
-	//10, 
-	//11, 
-	//12
+struct Sequence {
+	int notes[16];
+	int noteCount;
+	unsigned long initialTempo;
+	char name[16];
+	int tickSubdivisions;
 };
+
+struct StoreStruct {
+	Sequence sequences[10];
+	char version_of_program[4];
+} settings = {
+	{
+		{
+			{ 1, 2, 3, 5 },
+			4,
+			120.0,
+			"Sequence 1",
+			4,
+		}
+	},
+	CONFIG_VERSION
+};
+
+
+Sequence selectedSequence;
 
 struct MidiCompositeCommand {
 	int programChange;
@@ -52,7 +69,34 @@ struct MidiCompositeCommand notes[] = {
 	{ 2, 127 }, // +12
 };
 
+void loadConfig() {
+	if (
+		EEPROM.read(CONFIG_START + sizeof(settings) - 2) == settings.version_of_program[2] &&
+		EEPROM.read(CONFIG_START + sizeof(settings) - 3) == settings.version_of_program[1] &&
+		EEPROM.read(CONFIG_START + sizeof(settings) - 4) == settings.version_of_program[0]
+	){
+		for (unsigned int t=0; t<sizeof(settings); t++) {
+			*((char*)&settings + t) = EEPROM.read(CONFIG_START + t);
+		}
+	} else {
+		saveConfig();
+	}
+}
+
+void saveConfig() {
+	for (unsigned int t=0; t<sizeof(settings); t++){
+		EEPROM.write(CONFIG_START + t, *((char*)&settings + t));
+
+		if (EEPROM.read(CONFIG_START + t) != *((char*)&settings + t)){
+			// error writing to EEPROM
+		}
+	}
+}
+
 void setup() {
+	loadConfig();
+	selectSequence(0);
+
 	MIDI.begin(MIDI_CHANNEL_OMNI);
 	pinMode(TEMPO_LED_PIN, OUTPUT);
 	attachInterrupt(digitalPinToInterrupt(TEMPO_BUTTON_PIN), onButtonPress, RISING);
@@ -68,21 +112,36 @@ void loop() {
 	bool nextTickSubdivisionDue = timeNow > nextTickSubdivisionDueTime;
 	bool tempoLedOffDue = timeNow > tempoLedOffDueTime;
 
-	if (nextTickSubdivisionDue) {
-		MidiCompositeCommand note = notes[sequence[tickSubdivisionCount]];
+	if (nextTickSubdivisionDue && isPlaying) {
+		MidiCompositeCommand note = notes[selectedSequence.notes[tickSubdivisionCount]];
 		MIDI.sendControlChange(11, note.cc, 1);
 		MIDI.sendProgramChange(note.programChange - 1, 1);
 		
-		tickSubdivisionCount = (tickSubdivisionCount + 1) % (sizeof(sequence) / sizeof(int));
+		tickSubdivisionCount = (tickSubdivisionCount + 1) % (selectedSequence.noteCount);
 		lastTickSubdivision = timeNow;
 	}
 
-	if (nextTickDue) {
+	if (nextTickDue && isPlaying) {
 		lastTick = timeNow;
 		digitalWrite(TEMPO_LED_PIN, HIGH);
 	} else if (tempoLedOffDue) {
 		digitalWrite(TEMPO_LED_PIN, LOW);
 	}
+}
+
+void start() {
+	isPlaying = true;
+	lastTick = lastTickSubdivision = millis();
+}
+
+void stop() {
+	isPlaying = false;
+}
+
+void selectSequence(int index) {
+	selectedSequence = settings.sequences[index];
+	tempo = selectedSequence.initialTempo;
+	tickSubdivisions = selectedSequence.tickSubdivisions;
 }
 
 void onButtonPress() {
