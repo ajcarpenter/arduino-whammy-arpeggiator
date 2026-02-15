@@ -1,178 +1,141 @@
-#include <MIDI.h>
 #include <EEPROM.h>
+#include <MIDI.h>
 
-#define CONFIG_VERSION "ls1"
-#define CONFIG_START 32
+#include "WhammyArpEngine.h"
 
-struct Sequence;
+using whammy::MidiCompositeCommand;
+using whammy::Sequence;
+using whammy::WhammyArpeggiatorEngine;
 
 MIDI_CREATE_DEFAULT_INSTANCE();
 
-const int TEMPO_BUTTON_PIN = 2;
-const int TEMPO_LED_PIN = 13;
-const unsigned long TEMPO_LED_BLINK_TIME = 100.0;
-const unsigned long MS_IN_MINUTE = 60 * 1000.0;
+namespace {
 
-unsigned long tapTempoLastPressTimes[4];
-unsigned long tempo = 60.0;
-unsigned long lastTick = 0.0;
-unsigned long lastTickSubdivision = 0.0;
-int tickSubdivisionCount = 0;
-int tickSubdivisions = 4;
-bool isPlaying = false;
+const int kTempoButtonPin = 2;
+const int kTempoLedPin = 13;
+const uint8_t kWhammyMidiChannel = 1;
 
-struct Sequence {
-	int notes[16];
-	int noteCount;
-	unsigned long initialTempo;
-	char name[16];
-	int tickSubdivisions;
+const unsigned long kDebounceMs = 40;
+const unsigned long kStartupGraceMs = 250;
+
+const char kConfigVersion[4] = "W3";
+const int kConfigStartAddress = 64;
+
+struct PersistedSettings {
+  char version[4];
+  uint8_t sequenceCount;
+  Sequence sequences[whammy::kMaxSequences];
 };
 
-struct StoreStruct {
-	Sequence sequences[10];
-	char version_of_program[4];
-} settings = {
-	{
-		{
-			{ 1, 2, 3, 5 },
-			4,
-			120.0,
-			"Sequence 1",
-			4,
-		}
-	},
-	CONFIG_VERSION
+const PersistedSettings kFactorySettings = {
+    "W3",
+    6,
+    {
+        {{0, 4, 7, 12}, 4, 120, 4, "Major Triad"},
+        {{0, 3, 7, 10}, 4, 96, 4, "Minor7"},
+        {{0, 5, 7, 12}, 4, 128, 8, "Sus4 Drive"},
+        {{12, 7, 5, 3, 0}, 5, 90, 4, "Descending"},
+        {{0, 12, 7, 12, 4, 12}, 6, 140, 8, "Shimmer"},
+        {{0, 2, 4, 5, 7, 9, 11, 12}, 8, 110, 4, "Ionian Run"},
+    },
 };
 
+PersistedSettings settings;
+WhammyArpeggiatorEngine engine;
 
-Sequence selectedSequence;
+volatile bool buttonPressed = false;
+unsigned long lastDebouncedTapMs = 0;
+unsigned long setupMs = 0;
 
-struct MidiCompositeCommand {
-	int programChange;
-	int cc;
+class ArduinoMidiOutput : public whammy::MidiOutput {
+ public:
+  void sendWhammyCommand(const MidiCompositeCommand& command) {
+    MIDI.sendControlChange(11, command.ccValue, kWhammyMidiChannel);
+    MIDI.sendProgramChange(command.programChange - 1, kWhammyMidiChannel);
+  }
 };
 
-struct MidiCompositeCommand notes[] = {
-	{ 25, 0 }, // 0
-	{ 4, 25 }, // +1
-	{ 4, 51 }, // +2
-	{ 4, 76 }, // +3
-	{ 4, 101 }, // +4
-	{ 4, 127 }, // +5
-	{ 3, 109 }, // +6
-	{ 3, 127 }, // +7
-	{ 2, 85 }, // +8
-	{ 2, 95 }, // +9
-	{ 2, 106 }, // +10
-	{ 2, 116 }, // +11
-	{ 2, 127 }, // +12
-};
+ArduinoMidiOutput midiOutput;
 
-void loadConfig() {
-	if (
-		EEPROM.read(CONFIG_START + sizeof(settings) - 2) == settings.version_of_program[2] &&
-		EEPROM.read(CONFIG_START + sizeof(settings) - 3) == settings.version_of_program[1] &&
-		EEPROM.read(CONFIG_START + sizeof(settings) - 4) == settings.version_of_program[0]
-	){
-		for (unsigned int t=0; t<sizeof(settings); t++) {
-			*((char*)&settings + t) = EEPROM.read(CONFIG_START + t);
-		}
-	} else {
-		saveConfig();
-	}
+void copyFactorySettings() { settings = kFactorySettings; }
+
+void saveSettings() {
+  for (unsigned int i = 0; i < sizeof(PersistedSettings); ++i) {
+    EEPROM.update(kConfigStartAddress + i, *((const uint8_t*)&settings + i));
+  }
 }
 
-void saveConfig() {
-	for (unsigned int t=0; t<sizeof(settings); t++){
-		EEPROM.write(CONFIG_START + t, *((char*)&settings + t));
-
-		if (EEPROM.read(CONFIG_START + t) != *((char*)&settings + t)){
-			// error writing to EEPROM
-		}
-	}
+bool settingsVersionMatches() {
+  for (uint8_t i = 0; i < 2; ++i) {
+    if (settings.version[i] != kConfigVersion[i]) {
+      return false;
+    }
+  }
+  return true;
 }
+
+uint8_t clampSequenceCount(uint8_t count) {
+  if (count == 0 || count > whammy::kMaxSequences) {
+    return kFactorySettings.sequenceCount;
+  }
+  return count;
+}
+
+void loadSettings() {
+  for (unsigned int i = 0; i < sizeof(PersistedSettings); ++i) {
+    *((uint8_t*)&settings + i) = EEPROM.read(kConfigStartAddress + i);
+  }
+
+  if (!settingsVersionMatches()) {
+    copyFactorySettings();
+    saveSettings();
+    return;
+  }
+
+  settings.sequenceCount = clampSequenceCount(settings.sequenceCount);
+}
+
+void onTempoButtonInterrupt() { buttonPressed = true; }
+
+void applyTapTempoIfNeeded(unsigned long nowMs) {
+  if (!buttonPressed) {
+    return;
+  }
+  buttonPressed = false;
+
+  if (nowMs - setupMs < kStartupGraceMs) {
+    return;
+  }
+
+  if (nowMs - lastDebouncedTapMs < kDebounceMs) {
+    return;
+  }
+
+  lastDebouncedTapMs = nowMs;
+  engine.onTapTempo(nowMs);
+}
+
+}  // namespace
 
 void setup() {
-	loadConfig();
-	selectSequence(0);
+  pinMode(kTempoLedPin, OUTPUT);
+  pinMode(kTempoButtonPin, INPUT_PULLUP);
 
-	MIDI.begin(MIDI_CHANNEL_OMNI);
-	pinMode(TEMPO_LED_PIN, OUTPUT);
-	attachInterrupt(digitalPinToInterrupt(TEMPO_BUTTON_PIN), onButtonPress, RISING);
+  loadSettings();
+  engine.loadSequences(settings.sequences, settings.sequenceCount);
+  engine.selectSequence(0);
+
+  MIDI.begin(MIDI_CHANNEL_OMNI);
+  attachInterrupt(digitalPinToInterrupt(kTempoButtonPin), onTempoButtonInterrupt, FALLING);
+
+  setupMs = millis();
+  engine.start(setupMs);
 }
 
 void loop() {
-	unsigned long timeNow = millis();
-	unsigned long nextTickDueTime = lastTick + (MS_IN_MINUTE / tempo);
-	unsigned long nextTickSubdivisionDueTime = lastTickSubdivision + ((MS_IN_MINUTE / tempo) / tickSubdivisions);
-	unsigned long tempoLedOffDueTime = lastTick + TEMPO_LED_BLINK_TIME;
+  const unsigned long nowMs = millis();
+  applyTapTempoIfNeeded(nowMs);
 
-	bool nextTickDue = timeNow > nextTickDueTime;
-	bool nextTickSubdivisionDue = timeNow > nextTickSubdivisionDueTime;
-	bool tempoLedOffDue = timeNow > tempoLedOffDueTime;
-
-	if (nextTickSubdivisionDue && isPlaying) {
-		MidiCompositeCommand note = notes[selectedSequence.notes[tickSubdivisionCount]];
-		MIDI.sendControlChange(11, note.cc, 1);
-		MIDI.sendProgramChange(note.programChange - 1, 1);
-		
-		tickSubdivisionCount = (tickSubdivisionCount + 1) % (selectedSequence.noteCount);
-		lastTickSubdivision = timeNow;
-	}
-
-	if (nextTickDue && isPlaying) {
-		lastTick = timeNow;
-		digitalWrite(TEMPO_LED_PIN, HIGH);
-	} else if (tempoLedOffDue) {
-		digitalWrite(TEMPO_LED_PIN, LOW);
-	}
+  const bool ledOn = engine.update(nowMs, midiOutput);
+  digitalWrite(kTempoLedPin, ledOn ? HIGH : LOW);
 }
-
-void start() {
-	isPlaying = true;
-	lastTick = lastTickSubdivision = millis();
-}
-
-void stop() {
-	isPlaying = false;
-}
-
-void selectSequence(int index) {
-	selectedSequence = settings.sequences[index];
-	tempo = selectedSequence.initialTempo;
-	tickSubdivisions = selectedSequence.tickSubdivisions;
-}
-
-void onButtonPress() {
-	addTapTempoPressTime(millis());
-}
-
-void addTapTempoPressTime(unsigned long pressTime) {
-	tapTempoLastPressTimes[3] = tapTempoLastPressTimes[2];
-	tapTempoLastPressTimes[2] = tapTempoLastPressTimes[1];
-	tapTempoLastPressTimes[1] = tapTempoLastPressTimes[0];
-	tapTempoLastPressTimes[0] = pressTime;
-	lastTick = lastTickSubdivision = millis();
-	tickSubdivisionCount = 0;
-	calculateTempo();
-}
-
-void calculateTempo() {
-	unsigned long diffCutoff = 5000;
-	int count = 0;
-	unsigned long total = 0;
-
-	for (int i = 0; i < (sizeof(tapTempoLastPressTimes) / sizeof(long)) - 2; i++) {
-		unsigned long diff = tapTempoLastPressTimes[i] - tapTempoLastPressTimes[i + 1];
-		if (diff < diffCutoff) {
-			count++;
-			total += diff;
-		}
-	}
-
-	if (count > 0) {
-		tempo = MS_IN_MINUTE / (total / count) ;
-	}
-}
-
