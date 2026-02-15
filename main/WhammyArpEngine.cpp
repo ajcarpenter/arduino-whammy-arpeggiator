@@ -20,7 +20,7 @@ const MidiCompositeCommand kWhammyIntervals[kWhammyIntervalCount] = {
     {2, 127},  // +12
 };
 
-TapTempo::TapTempo() : tempoBpm_(120) {
+TapTempo::TapTempo() : tempoBpm_(kDefaultTempoBpm) {
   for (uint8_t i = 0; i < kTapHistory; ++i) {
     taps_[i] = 0;
     hasTap_[i] = false;
@@ -51,7 +51,7 @@ void TapTempo::recomputeTempo() {
       continue;
     }
 
-    unsigned long diff = taps_[i] - taps_[i + 1];
+    const unsigned long diff = taps_[i] - taps_[i + 1];
     if (diff <= maxGapMs) {
       sum += diff;
       ++count;
@@ -62,27 +62,53 @@ void TapTempo::recomputeTempo() {
     return;
   }
 
-  unsigned long avgMs = sum / count;
+  const unsigned long avgMs = sum / count;
   if (avgMs == 0) {
     return;
   }
-  tempoBpm_ = static_cast<unsigned int>(kMsInMinute / avgMs);
+
+  unsigned int bpm = static_cast<unsigned int>(kMsInMinute / avgMs);
+  if (bpm < kMinTempoBpm) {
+    bpm = kMinTempoBpm;
+  }
+  if (bpm > kMaxTempoBpm) {
+    bpm = kMaxTempoBpm;
+  }
+  tempoBpm_ = bpm;
 }
 
 WhammyArpeggiatorEngine::WhammyArpeggiatorEngine() : sequenceCount_(0) {
   state_.isPlaying = false;
   state_.selectedSequence = 0;
   state_.currentStep = 0;
-  state_.tempoBpm = 120;
+  state_.tempoBpm = kDefaultTempoBpm;
   state_.lastBeatMs = 0;
   state_.lastSubdivisionMs = 0;
   state_.beatLedOn = false;
+}
+
+void WhammyArpeggiatorEngine::sanitizeSequence(Sequence& sequence) const {
+  if (sequence.stepCount == 0 || sequence.stepCount > kMaxSequenceSteps) {
+    sequence.stepCount = 1;
+    sequence.intervals[0] = 0;
+  }
+
+  if (sequence.initialTempoBpm == 0) {
+    sequence.initialTempoBpm = kDefaultTempoBpm;
+  }
+
+  if (sequence.tickSubdivisions == 0) {
+    sequence.tickSubdivisions = 4;
+  }
+
+  sequence.name[sizeof(sequence.name) - 1] = '\0';
 }
 
 void WhammyArpeggiatorEngine::loadSequences(const Sequence* sequences, uint8_t count) {
   sequenceCount_ = count > kMaxSequences ? kMaxSequences : count;
   for (uint8_t i = 0; i < sequenceCount_; ++i) {
     sequences_[i] = sequences[i];
+    sanitizeSequence(sequences_[i]);
   }
   if (sequenceCount_ > 0) {
     selectSequence(0);
@@ -96,7 +122,7 @@ bool WhammyArpeggiatorEngine::selectSequence(uint8_t index) {
 
   state_.selectedSequence = index;
   const Sequence& sequence = sequences_[index];
-  state_.tempoBpm = sequence.initialTempoBpm == 0 ? 120 : sequence.initialTempoBpm;
+  state_.tempoBpm = sequence.initialTempoBpm;
   state_.currentStep = 0;
   return true;
 }
@@ -136,26 +162,28 @@ bool WhammyArpeggiatorEngine::update(unsigned long nowMs, MidiOutput& output) {
   const unsigned long beatMs = beatIntervalMs();
   const unsigned long subdivMs = subdivisionIntervalMs();
 
-  if (nowMs - state_.lastSubdivisionMs >= subdivMs) {
-    const Sequence& sequence = sequences_[state_.selectedSequence];
-    if (sequence.stepCount > 0) {
-      int8_t interval = sequence.intervals[state_.currentStep % sequence.stepCount];
-      if (interval < 0) {
-        interval = 0;
-      }
-      if (interval >= static_cast<int8_t>(kWhammyIntervalCount)) {
-        interval = kWhammyIntervalCount - 1;
-      }
-      output.sendWhammyCommand(kWhammyIntervals[interval]);
-      state_.currentStep = (state_.currentStep + 1) % sequence.stepCount;
+  const Sequence& sequence = sequences_[state_.selectedSequence];
+
+  uint8_t emitted = 0;
+  while (nowMs - state_.lastSubdivisionMs >= subdivMs && emitted < kMaxTicksPerUpdate) {
+    int8_t interval = sequence.intervals[state_.currentStep % sequence.stepCount];
+    if (interval < 0) {
+      interval = 0;
     }
-    state_.lastSubdivisionMs = nowMs;
+    if (interval >= static_cast<int8_t>(kWhammyIntervalCount)) {
+      interval = kWhammyIntervalCount - 1;
+    }
+    output.sendWhammyCommand(kWhammyIntervals[interval]);
+    state_.currentStep = (state_.currentStep + 1) % sequence.stepCount;
+    state_.lastSubdivisionMs += subdivMs;
+    ++emitted;
   }
 
   if (nowMs - state_.lastBeatMs >= beatMs) {
-    state_.lastBeatMs = nowMs;
+    // Preserve phase when loop jitter is high by stepping in beat-sized increments.
+    state_.lastBeatMs += ((nowMs - state_.lastBeatMs) / beatMs) * beatMs;
     state_.beatLedOn = true;
-  } else if (nowMs - state_.lastBeatMs >= 100) {
+  } else if (nowMs - state_.lastBeatMs >= kLedPulseMs) {
     state_.beatLedOn = false;
   }
 
@@ -169,14 +197,15 @@ const Sequence& WhammyArpeggiatorEngine::selectedSequence() const {
 }
 
 unsigned long WhammyArpeggiatorEngine::beatIntervalMs() const {
-  const unsigned int tempo = state_.tempoBpm == 0 ? 120 : state_.tempoBpm;
+  const unsigned int tempo = state_.tempoBpm == 0 ? kDefaultTempoBpm : state_.tempoBpm;
   return kMsInMinute / tempo;
 }
 
 unsigned long WhammyArpeggiatorEngine::subdivisionIntervalMs() const {
   const Sequence& sequence = sequences_[state_.selectedSequence];
   const uint8_t subdivisions = sequence.tickSubdivisions == 0 ? 4 : sequence.tickSubdivisions;
-  return beatIntervalMs() / subdivisions;
+  const unsigned long interval = beatIntervalMs() / subdivisions;
+  return interval == 0 ? 1 : interval;
 }
 
 }  // namespace whammy

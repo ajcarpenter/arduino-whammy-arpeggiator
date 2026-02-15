@@ -4,10 +4,15 @@
 
 namespace whammy {
 
+// Whammy command table supports chromatic shifts from unison to +12 semitones.
+static const uint8_t kWhammyIntervalCount = 13;
+
+// Project limits kept intentionally small for AVR SRAM.
 static const uint8_t kMaxSequenceSteps = 16;
 static const uint8_t kMaxSequences = 8;
-static const uint8_t kWhammyIntervalCount = 13;
+
 static const unsigned long kMsInMinute = 60000UL;
+static const unsigned int kDefaultTempoBpm = 120;
 
 struct MidiCompositeCommand {
   uint8_t programChange;  // 1-indexed in the original Whammy MIDI chart.
@@ -48,6 +53,9 @@ class TapTempo {
 
  private:
   static const uint8_t kTapHistory = 5;
+  static const unsigned int kMinTempoBpm = 30;
+  static const unsigned int kMaxTempoBpm = 300;
+
   unsigned long taps_[kTapHistory];
   bool hasTap_[kTapHistory];
   unsigned int tempoBpm_;
@@ -75,11 +83,15 @@ class WhammyArpeggiatorEngine {
   const Sequence& selectedSequence() const;
 
  private:
+  static const unsigned long kLedPulseMs = 100;
+  static const uint8_t kMaxTicksPerUpdate = 8;
+
   Sequence sequences_[kMaxSequences];
   uint8_t sequenceCount_;
   RuntimeState state_;
   TapTempo tapTempo_;
 
+  void sanitizeSequence(Sequence& sequence) const;
   unsigned long beatIntervalMs() const;
   unsigned long subdivisionIntervalMs() const;
 };

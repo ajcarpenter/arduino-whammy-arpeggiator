@@ -17,7 +17,7 @@ whammy::Sequence makeSequence(const int8_t* intervals, uint8_t count,
                               unsigned int bpm, uint8_t subdivisions,
                               const char* name) {
   whammy::Sequence seq = {};
-  for (uint8_t i = 0; i < count; ++i) {
+  for (uint8_t i = 0; i < count && i < whammy::kMaxSequenceSteps; ++i) {
     seq.intervals[i] = intervals[i];
   }
   seq.stepCount = count;
@@ -57,7 +57,6 @@ void testTapTempoChangesBpm() {
   fastEngine.onTapTempo(1000);
   fastEngine.onTapTempo(1500);
   fastEngine.onTapTempo(2000);
-  // 500ms between taps => 120 BPM.
   assert(fastEngine.state().tempoBpm == 120);
 
   whammy::WhammyArpeggiatorEngine slowEngine;
@@ -66,7 +65,6 @@ void testTapTempoChangesBpm() {
   slowEngine.onTapTempo(0);
   slowEngine.onTapTempo(1000);
   slowEngine.onTapTempo(2000);
-  // 1000ms between taps => 60 BPM.
   assert(slowEngine.state().tempoBpm >= 59 && slowEngine.state().tempoBpm <= 61);
 }
 
@@ -83,8 +81,8 @@ void testOutOfRangeIntervalsAreClamped() {
   engine.update(500, out);
 
   assert(out.commands.size() == 2);
-  assert(out.commands[0].programChange == 25);  // clamped to interval 0.
-  assert(out.commands[1].programChange == 2);   // clamped to max interval 12.
+  assert(out.commands[0].programChange == 25);
+  assert(out.commands[1].programChange == 2);
 }
 
 void testStopPreventsFurtherOutput() {
@@ -106,11 +104,40 @@ void testStopPreventsFurtherOutput() {
   assert(out.commands.size() == commandCountBefore);
 }
 
+void testInvalidSequenceGetsSanitized() {
+  const int8_t notes[] = {7};
+  whammy::Sequence seq = makeSequence(notes, 0, 0, 0, "bad");
+
+  whammy::WhammyArpeggiatorEngine engine;
+  engine.loadSequences(&seq, 1);
+
+  const whammy::Sequence& selected = engine.selectedSequence();
+  assert(selected.stepCount == 1);
+  assert(selected.initialTempoBpm == whammy::kDefaultTempoBpm);
+  assert(selected.tickSubdivisions == 4);
+}
+
+void testUpdateCatchesUpAfterTimingGap() {
+  const int8_t notes[] = {0, 4, 7, 12};
+  whammy::Sequence seq = makeSequence(notes, 4, 120, 4, "catchup");
+
+  whammy::WhammyArpeggiatorEngine engine;
+  engine.loadSequences(&seq, 1);
+  engine.start(0);
+
+  RecordingOutput out;
+  engine.update(1000, out);
+  // At 120 BPM and 4 subdivisions, 1000ms means 8 expected ticks.
+  assert(out.commands.size() == 8);
+}
+
 int main() {
   testSequencePlaybackRespectsSubdivisions();
   testTapTempoChangesBpm();
   testOutOfRangeIntervalsAreClamped();
   testStopPreventsFurtherOutput();
+  testInvalidSequenceGetsSanitized();
+  testUpdateCatchesUpAfterTimingGap();
   printf("All Whammy arpeggiator simulation tests passed.\n");
   return 0;
 }

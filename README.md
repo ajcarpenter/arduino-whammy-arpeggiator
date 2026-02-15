@@ -1,84 +1,83 @@
 # Arduino Whammy Arpeggiator (Rebuilt)
 
-A complete rewrite of the original sketch into a maintainable project with:
+A full modernization of the original sketch into a small, testable system that still fits classic Arduino constraints.
 
-- a reusable arpeggiator engine,
-- a cleaner Arduino runtime layer,
-- persisted sequence presets in EEPROM,
-- and a host-side simulation harness with automated tests.
+## What this version improves
 
-## Why this rewrite
-
-The original project worked, but mixed timing, tap-tempo, MIDI mapping, storage, and board-specific code in one sketch. This rewrite separates those concerns so it is easier to:
-
-- understand,
-- extend,
-- verify without hardware,
-- and keep stable over time.
+- **Clear architecture:** timing and musical logic live in a reusable engine, while `main.ino` handles board wiring and peripherals.
+- **Safer persistence:** EEPROM settings are versioned and written with `EEPROM.update` to reduce unnecessary flash wear.
+- **More musical defaults:** multiple factory presets are included so the device is useful immediately.
+- **Hardware-free validation:** a desktop simulation harness exercises core behavior with repeatable tests.
 
 ## Project layout
 
-- `main/main.ino` — Arduino-specific glue (pins, EEPROM load/save, MIDI send, interrupt wiring).
-- `main/WhammyArpEngine.h` / `main/WhammyArpEngine.cpp` — platform-agnostic arpeggiator engine.
-- `sim/WhammyArpEngineTests.cpp` — desktop simulation harness + tests.
+- `main/main.ino` — Arduino runtime integration (pins, ISR wiring, EEPROM, MIDI adapter).
+- `main/WhammyArpEngine.h` / `main/WhammyArpEngine.cpp` — platform-neutral engine.
+- `sim/WhammyArpEngineTests.cpp` — host simulation + assertions.
 
-## Core behavior
+## Engine behavior
 
 ### Sequence model
 
-Each sequence has:
+Each sequence contains:
 
-- up to 16 semitone intervals (`0..12` supported by the Whammy mapping),
+- up to 16 interval steps,
 - step count,
 - initial tempo,
 - beat subdivisions,
 - name.
 
-At runtime the engine iterates sequence steps on each subdivision tick and emits the corresponding MIDI command pair:
+Invalid sequence values are sanitized when loaded (minimum one step, default tempo, default subdivisions), making EEPROM corruption less likely to break runtime behavior.
 
-- Control Change 11 (for fine position), then
-- Program Change (for whammy mode bank).
+### MIDI output
+
+On each subdivision tick the engine emits one composite Whammy command:
+
+1. Control Change #11 for parameter position.
+2. Program Change for Whammy slot selection.
+
+The original interval table (0 to +12 semitones) is preserved.
+
+### Timing and jitter handling
+
+- Subdivision and beat timers run independently.
+- If `loop()` is delayed, the engine catches up a bounded number of ticks in one update to keep musical phase coherent.
+- Beat LED pulses for ~100ms each beat.
 
 ### Tap tempo
 
-- Tap timestamps are recorded with short history.
-- Tempo is computed from recent valid intervals (< 5 seconds).
-- New tempo immediately resets beat/subdivision clocks and sequence step index for tight sync.
+- Tap history is averaged across recent valid taps.
+- Tempo is clamped to a practical range (30–300 BPM).
+- New tap tempo immediately re-aligns beat/subdivision timers and sequence position.
 
-### LED pulse
+## Arduino runtime behavior
 
-- LED turns on at each beat.
-- LED turns off after ~100ms pulse width.
+`main.ino` uses interrupt-safe button handling:
 
-### EEPROM persistence
-
-`main.ino` loads a `PersistedSettings` block from EEPROM with version checking.
-
-- If EEPROM version mismatches, factory defaults are installed and saved.
-- Defaults include several musical sequences to be useful immediately.
+- ISR only sets a flag.
+- Debounce and startup grace logic run in the main loop.
+- Button defaults to `INPUT_PULLUP` + `FALLING` trigger for robust wiring with a simple momentary switch to ground.
 
 ## Running simulation tests
 
-From repository root:
+From repo root:
 
 ```bash
 g++ -std=c++17 -Wall -Wextra -pedantic -o sim/whammy_tests sim/WhammyArpEngineTests.cpp main/WhammyArpEngine.cpp
 ./sim/whammy_tests
 ```
 
-## Adapting for your board
+## Suggested hardware hookup
 
-In `main/main.ino` adjust:
+- Tempo button: between `kTempoButtonPin` and GND.
+- Tempo LED: `kTempoLedPin` -> resistor -> LED -> GND.
+- MIDI out: standard UART MIDI interface matching your board design.
+
+## Tuning points
+
+Adjust in `main/main.ino`:
 
 - `kTempoButtonPin`
 - `kTempoLedPin`
 - `kWhammyMidiChannel`
-- factory preset sequences
-
-for your hardware wiring and musical preferences.
-
-## Notes
-
-- This rewrite keeps the original Whammy interval mapping table as the canonical source.
-- Intervals outside the valid range are clamped safely.
-- Heavy work is avoided in interrupt context; ISR only sets a flag and debouncing is done in the main loop.
+- `kFactorySettings` sequences and `sequenceCount`
